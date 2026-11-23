@@ -16,11 +16,14 @@ def _client():
     return Groq()
 
 
-def transcribe(audio: bytes, filename: str, keywords: list[str]) -> str:
+def transcribe(audio: bytes, filename: str, keywords: list[str] | None = None) -> str:
     # Whisper's prompt biases spelling toward the candidate's own tools and project names.
-    result = _client().audio.transcriptions.create(
-        file=(filename, audio), model=STT_MODEL, language="en", prompt=", ".join(keywords)[:800],
-    )
+    keywords = keywords or []
+    prompt = ", ".join(keywords)[:800] if keywords else None
+    kwargs = {"file": (filename, audio), "model": STT_MODEL, "language": "en"}
+    if prompt:
+        kwargs["prompt"] = prompt
+    result = _client().audio.transcriptions.create(**kwargs)
     return result.text.strip()
 
 

@@ -87,7 +87,9 @@ def answer(sid: str, audio: UploadFile | None = File(None), text: str | None = F
         if text and text.strip():
             said = text.strip()
         elif audio:
-            said = voice.transcribe(audio.file.read(MAX_UPLOAD), audio.filename or "answer.webm", state.values["profile"]["keywords"])
+            profile = state.values.get("profile") or {}
+            keywords = profile.get("keywords") or []
+            said = voice.transcribe(audio.file.read(MAX_UPLOAD), audio.filename or "answer.webm", keywords)
         else:
             said = ""
         if len(said) < 2:

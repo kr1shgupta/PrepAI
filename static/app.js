@@ -258,46 +258,189 @@ function speakBrowser(text, words) {
 }
 let stopSpeaking = () => {};
 
-// ------------------------------------------------------------------ listening (VAD)
+// ------------------------------------------------------------------ listening (VAD & Devices)
 
 let mic = null;
 let stopListening = null;
 let cancelListening = null;
+let selectedDeviceId = null;
 
-async function openMic() {
-  if (mic) return mic;
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+async function refreshAudioDevices(currentTrackLabel = "") {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === "audioinput");
+    const select = $("#mic-select");
+    if (!select) return;
+    select.replaceChildren();
+
+    const defOpt = el("option", "", "Default Microphone");
+    defOpt.value = "";
+    select.append(defOpt);
+
+    for (const dev of inputs) {
+      const opt = el("option", "", dev.label || `Microphone (${dev.deviceId.slice(0, 6)}...)`);
+      opt.value = dev.deviceId;
+      if (dev.deviceId === selectedDeviceId || (currentTrackLabel && dev.label === currentTrackLabel)) {
+        opt.selected = true;
+      }
+      select.append(opt);
+    }
+  } catch (err) {
+    console.warn("Could not enumerate audio devices:", err);
+  }
+}
+
+function updateMicBadge(label, isDisconnected = false) {
+  const badge = $("#mic-badge");
+  const name = $("#mic-name");
+  if (!badge || !name) return;
+  name.textContent = label || "Default Mic";
+  if (isDisconnected) {
+    badge.classList.add("disconnected");
+    name.textContent = `${label || "Mic"} (Disconnected)`;
+  } else {
+    badge.classList.remove("disconnected");
+  }
+}
+
+$("#mic-select")?.addEventListener("change", async (e) => {
+  selectedDeviceId = e.target.value || null;
+  if (mic) {
+    try { mic.stream?.getTracks().forEach((t) => t.stop()); } catch {}
+    mic = null;
+  }
+  if (phase === "listening") {
+    stopListening?.();
+    setTimeout(() => listen(), 150);
+  } else {
+    await openMic(selectedDeviceId).catch(() => {});
+  }
+});
+
+navigator.mediaDevices?.addEventListener("devicechange", async () => {
+  console.log("Audio device change detected");
+  await refreshAudioDevices();
+  if (mic) {
+    const track = mic.stream?.getAudioTracks()[0];
+    if (!track || track.readyState === "ended" || track.muted) {
+      updateMicBadge(track?.label || "Mic", true);
+      mic = null;
+      if (phase === "listening") {
+        setPhase("idle", `Microphone disconnected. Tap "${track?.label || "Mic"}" above to switch to Built-in Mic`);
+      }
+    }
+  }
+});
+
+async function openMic(deviceId = null) {
+  if (deviceId !== undefined && deviceId !== null) selectedDeviceId = deviceId;
+  if (mic && mic.stream && mic.stream.active && mic.stream.getAudioTracks().some((t) => t.readyState === "live" && !t.muted)) {
+    return mic;
+  }
+  if (mic?.stream) {
+    try { mic.stream.getTracks().forEach((t) => t.stop()); } catch {}
+    mic = null;
+  }
+
+  const audioConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+  if (selectedDeviceId) {
+    audioConstraints.deviceId = { exact: selectedDeviceId };
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+  } catch (err) {
+    if (selectedDeviceId) {
+      console.warn("Selected mic failed, falling back to default:", err);
+      selectedDeviceId = null;
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } else {
+      throw err;
+    }
+  }
+
+  const track = stream.getAudioTracks()[0];
+  updateMicBadge(track.label, track.muted);
+  await refreshAudioDevices(track.label);
+
+  track.onended = () => {
+    console.warn("Mic track ended:", track.label);
+    updateMicBadge(track.label, true);
+    mic = null;
+    if (phase === "listening") {
+      setPhase("idle", `Microphone "${track.label}" disconnected. Tap above to switch to Built-in Mic`);
+    }
+  };
+
+  track.onmute = () => {
+    console.warn("Mic track muted:", track.label);
+    updateMicBadge(track.label, true);
+    if (phase === "listening") {
+      setPhase("idle", `Microphone "${track.label}" was disconnected by macOS. Tap above to switch to Built-in Mic`);
+    }
+  };
+
+  track.onunmute = () => {
+    updateMicBadge(track.label, false);
+  };
+
   const ctx = audio();
+  if (ctx.state === "suspended") {
+    await ctx.resume();
+  }
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
-  ctx.createMediaStreamSource(stream).connect(analyser);
+  const source = ctx.createMediaStreamSource(stream);
+  source.connect(analyser);
   const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
-  return (mic = { stream, ctx, analyser, mimeType });
+  return (mic = { stream, ctx, analyser, source, mimeType });
 }
 
 // Resolves with the recorded Blob, or null if nothing was said.
 async function record() {
   const { ctx, analyser, stream, mimeType } = await openMic();
-  await ctx.resume();
+  if (ctx.state === "suspended") await ctx.resume();
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   const chunks = [];
-  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  recorder.start(250);
+  recorder.ondataavailable = (e) => e.data && e.data.size && chunks.push(e.data);
+  recorder.start(200);
 
   const samples = new Float32Array(analyser.fftSize);
   const began = performance.now();
-  let floor = 0.008, spoke = false, loudFrames = 0, lastVoice = began, raf = 0;
+  let floor = 0.005, spoke = false, loudFrames = 0, lastVoice = began, raf = 0;
 
   return new Promise((resolve) => {
-    const finish = (keep) => {
+    let stopped = false;
+    const finish = (keep, manual = false) => {
+      if (stopped) return;
+      stopped = true;
       cancelAnimationFrame(raf);
       stopListening = cancelListening = null;
       mainOrb.setLevel(0);
-      recorder.onstop = () => resolve(keep && spoke ? new Blob(chunks, { type: recorder.mimeType }) : null);
-      recorder.stop();
+
+      const deliver = () => {
+        const hasAudio = chunks.length > 0 && chunks.some((c) => c.size > 0);
+        const shouldKeep = keep && (spoke || manual) && hasAudio;
+        resolve(shouldKeep ? new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" }) : null);
+      };
+
+      if (recorder.state !== "inactive") {
+        recorder.onstop = deliver;
+        try { recorder.stop(); } catch { deliver(); }
+      } else {
+        deliver();
+      }
     };
-    stopListening = () => finish(true);
-    cancelListening = () => finish(false);
+    stopListening = () => finish(true, true);
+    cancelListening = () => finish(false, false);
 
     const tick = () => {
       analyser.getFloatTimeDomainData(samples);
@@ -305,17 +448,27 @@ async function record() {
       for (const s of samples) sum += s * s;
       const rms = Math.sqrt(sum / samples.length);
       const now = performance.now();
-      mainOrb.setLevel(Math.min(1, rms * 9));
 
-      if (now - began < 350) floor = Math.min(0.05, Math.max(floor, rms)); // calibrate to room noise
-      if (rms > Math.max(0.02, floor * 2.5)) {
-        if (++loudFrames > 4) spoke = true; // ~70ms of sound, not a click
+      // Responsive orb feedback
+      mainOrb.setLevel(Math.min(1, Math.max(0, (rms - floor) * 16)));
+
+      // Adapt noise floor smoothly to ambient sound, avoiding locking onto speech starts
+      if (now - began < 400) {
+        floor = Math.min(0.02, Math.max(0.003, floor * 0.9 + Math.min(rms, 0.02) * 0.1));
+      }
+
+      const threshold = Math.max(0.010, floor * 1.6);
+      if (rms > threshold) {
+        loudFrames = Math.min(20, loudFrames + 2);
+        if (loudFrames >= 4) spoke = true;
         lastVoice = now;
-      } else loudFrames = 0;
+      } else {
+        loudFrames = Math.max(0, loudFrames - 1);
+      }
 
-      if (spoke && now - lastVoice > SILENCE_MS) return finish(true);
-      if (!spoke && now - began > NO_SPEECH_MS) return finish(false);
-      if (now - began > MAX_ANSWER_MS) return finish(true);
+      if (spoke && now - lastVoice > SILENCE_MS) return finish(true, false);
+      if (!spoke && now - began > NO_SPEECH_MS) return finish(false, false);
+      if (now - began > MAX_ANSWER_MS) return finish(true, false);
       raf = requestAnimationFrame(tick);
     };
     tick();
@@ -355,7 +508,8 @@ async function listen() {
     setPhase("listening");
     blob = await record();
   } catch (err) {
-    setPhase("idle", "Mic blocked. Allow it, or type in the transcript panel");
+    console.error("Mic access error:", err);
+    setPhase("idle", "Mic blocked or unavailable. Allow it, or type in the transcript panel");
     return;
   }
   if (!blob) {
@@ -364,7 +518,8 @@ async function listen() {
     return;
   }
   const form = new FormData();
-  form.append("audio", blob, blob.type.includes("mp4") ? "answer.mp4" : blob.type.includes("ogg") ? "answer.ogg" : "answer.webm");
+  const ext = blob.type.includes("mp4") ? "mp4" : blob.type.includes("ogg") ? "ogg" : blob.type.includes("wav") ? "wav" : "webm";
+  form.append("audio", blob, `answer.${ext}`);
   await submit(form);
 }
 
